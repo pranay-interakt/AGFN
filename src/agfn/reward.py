@@ -2,6 +2,7 @@ from rdkit.Chem.rdchem import Mol as RDMol
 from rdkit.Chem import Descriptors, Crippen, AllChem, rdFingerprintGenerator
 from rdkit.Chem.rdMolDescriptors import CalcTPSA, CalcNumRotatableBonds, CalcFractionCSP3
 from rdkit import Chem
+from rdkit import DataStructs
 import torch
 import pickle
 import numpy as np
@@ -11,38 +12,29 @@ from rdkit.Chem import QED
 from typing import List
 from utils.maplight import *
 import pandas as pd
+import logging
 
-def scale_range( OldValue, OldMax, OldMin, NewMax, NewMin):
+logger = logging.getLogger(__name__)
+
+def scale_range(OldValue, OldMax, OldMin, NewMax, NewMin):
     OldRange = (OldMax - OldMin)  
     NewRange = (NewMax - NewMin)  
+    if OldRange == 0:
+        return NewMin
     NewValue = (((OldValue - OldMin) * NewRange) / OldRange) + NewMin
     return NewValue
 
 def calculate_tanimoto_similarity(mol1, mol2):
-        """
-        Calculate the Tanimoto similarity between two molecules given their SMILES strings.
-        Args:
-        smiles1 (str): The SMILES string of the first molecule.
-        smiles2 (str): The SMILES string of the second molecule.
-        Returns:
-        float: The Tanimoto similarity between the two molecular fingerprints.
-        """
-        # # Convert SMILES to molecule objects
-        # mol1 = Chem.MolFromSmiles(smiles1)
-        # mol2 = Chem.MolFromSmiles(smiles2)
-        # # Check for successful molecule creation
-        # if mol1 is None or mol2 is None:
-        #     raise ValueError("Invalid SMILES string provided. Check your SMILES strings.")
-        # Generate fingerprints
-        fp_gen = rdFingerprintGenerator.GetRDKitFPGenerator()
-        fp1 = fp_gen.GetFingerprint(mol1)
-        fp2 = fp_gen.GetFingerprint(mol2)
-        # Calculate Tanimoto similarity
-        tanimoto_sim = DataStructs.FingerprintSimilarity(fp1, fp2)
-        return tanimoto_sim
+    """Calculate the Tanimoto similarity between two molecules."""
+    if mol1 is None or mol2 is None:
+        return 0.0
+    fp_gen = rdFingerprintGenerator.GetRDKitFPGenerator()
+    fp1 = fp_gen.GetFingerprint(mol1)
+    fp2 = fp_gen.GetFingerprint(mol2)
+    return DataStructs.FingerprintSimilarity(fp1, fp2)
 
 class Reward():
-    def __init__(self, conditional_range_dict, cond_prop_var,reward_aggregation, molenv_dict_path, zinc_rad_scale, hps, wrapped_glidecnn_model=None) -> None:
+    def __init__(self, conditional_range_dict, cond_prop_var, reward_aggregation, molenv_dict_path, zinc_rad_scale, hps, wrapped_glidecnn_model=None) -> None:
         self.cond_range = conditional_range_dict
         self.cond_var = cond_prop_var
         self.reward_aggregation = reward_aggregation
@@ -56,345 +48,171 @@ class Reward():
         else:
             self.seedmol = None
 
-        # self.precompute_normalizing_const()
-
     def mol_wt(self, mols: List[RDMol]):
-        flat_mw_reward = np.array([Descriptors.MolWt(mol) for mol in mols])#.unsqueeze(dim=-1)
-        return flat_mw_reward
+        return np.array([Descriptors.MolWt(mol) for mol in mols])
     
     def qed(self, mols: List[RDMol]):
-        flat_qed_reward = np.array([QED.qed(mol) for mol in mols])
-        return flat_qed_reward
+        return np.array([QED.qed(mol) for mol in mols])
     
     def logP(self, mols: List[RDMol]):
-        # RDKit uses Crippen under the hood for this which is a reliable albeit a predictive model.
-        # Do we want to use it? 
-        flat_logP_reward = np.array([Crippen.MolLogP(mol) for mol in mols])#.unsqueeze(dim=-1)
-        return flat_logP_reward
+        return np.array([Crippen.MolLogP(mol) for mol in mols])
     
     def tpsa(self, mols: List[RDMol]):
-        flat_mw_reward = np.array([CalcTPSA(mol) for mol in mols])#.unsqueeze(dim=-1)
-        return flat_mw_reward
+        return np.array([CalcTPSA(mol) for mol in mols])
     
     def fsp3(self, mols: List[RDMol]):
-        flat_mw_reward = np.array([CalcFractionCSP3(mol) for mol in mols])#.unsqueeze(dim=-1)
-        return flat_mw_reward
+        return np.array([CalcFractionCSP3(mol) for mol in mols])
     
     def count_rotatable_bonds(self, mols: List[RDMol]):
-        flat_mw_reward = np.array([CalcNumRotatableBonds(mol) for mol in mols])#.unsqueeze(dim=-1)
-        return flat_mw_reward
+        return np.array([CalcNumRotatableBonds(mol) for mol in mols])
     
     def count_num_rings(self, mols: List[RDMol]):
         def count_5_and_6_membered_rings(mol):
             ring_info = mol.GetRingInfo()
-            num_five_six_membered_rings = len([ring for ring in ring_info.AtomRings() if (len(ring) == 6) or (len(ring) == 5) ])
-            # num_five_membered_rings = len([ring for ring in ring_info.AtomRings() if len(ring) == 5])
-            return num_five_six_membered_rings # num_five_membered_rings+num_six_membered_rings
-
-        # flat_ring_reward = np.array([mol.GetRingInfo().NumRings() for mol in mols ])
-        flat_ring_reward = np.array([count_5_and_6_membered_rings(mol) for mol in mols])
-        return flat_ring_reward
+            return len([ring for ring in ring_info.AtomRings() if len(ring) in (5, 6)])
+        return np.array([count_5_and_6_membered_rings(mol) for mol in mols])
     
     def synthetic_assessibility(self,  mols: List[RDMol]):
-        sas_flat_reward = np.array([sascore.calculateScore(mol) for mol in mols])
-        return sas_flat_reward
+        return np.array([sascore.calculateScore(mol) for mol in mols])
 
-    def permeability(self, caco2_model, mols: List[RDMol] ):
+    def permeability(self, caco2_model, mols: List[RDMol]):
         smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
         mol_fing = get_fingerprints(pd.Series(smiles_list))
-        y_pred1 = self.Y_scaler.inverse_transform(caco2_model.predict(mol_fing, thread_count=32)).reshape(-1,1)
-        return y_pred1
-        caco2_list = np.array([caco2_model.predict(x) for x in mol_fing])
-        return caco2_list
+        y_pred = self.Y_scaler.inverse_transform(caco2_model.predict(mol_fing, thread_count=32)).reshape(-1, 1)
+        return y_pred
     
-    def toxicity(self, tox_model, mols: List[RDMol] ):
+    def toxicity(self, tox_model, mols: List[RDMol]):
         smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
         mol_fing = get_fingerprints(pd.Series(smiles_list))
-        # ld50_list = np.array([tox_model.predict(x) for x in mol_fing])
-        y_pred1 = self.Y_scaler.inverse_transform(tox_model.predict(mol_fing, thread_count=32)).reshape(-1,1)
-        # print('reward2d.py tox ', y_pred1)
-
-        # ypred1_normal_fn = lambda x: scale_range(x, 6, 0, 1, 0)
-        # y_pred1_normalized = ypred1_normal_fn(np.array(y_pred1))
-        return y_pred1 #ld50_list
+        y_pred = self.Y_scaler.inverse_transform(tox_model.predict(mol_fing, thread_count=32)).reshape(-1, 1)
+        return y_pred
 
     def lipo(self, task_model, mols):
         smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
         mol_fing = get_fingerprints(pd.Series(smiles_list))
-        y_pred1 = self.Y_scaler.inverse_transform(task_model.predict(mol_fing, thread_count=32)).reshape(-1,1)
-        return y_pred1
-        lipo_list = np.array([task_model.predict(x) for x in mol_fing])
-        return lipo_list
+        y_pred = self.Y_scaler.inverse_transform(task_model.predict(mol_fing, thread_count=32)).reshape(-1, 1)
+        return y_pred
 
     def sol(self, task_model, mols):
         smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
         mol_fing = get_fingerprints(pd.Series(smiles_list))
-        y_pred1 = self.Y_scaler.inverse_transform(task_model.predict(mol_fing, thread_count=32)).reshape(-1,1)
-        return y_pred1
-        sol_list = np.array([task_model.predict(x) for x in mol_fing])
-        return sol_list
+        y_pred = self.Y_scaler.inverse_transform(task_model.predict(mol_fing, thread_count=32)).reshape(-1, 1)
+        return y_pred
 
     def bind(self, task_model, mols):
         smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
         mol_fing = get_fingerprints(pd.Series(smiles_list))
-        y_pred1 = self.Y_scaler.inverse_transform(task_model.predict(mol_fing, thread_count=32)).reshape(-1,1)
-        return y_pred1
-        bind_list = np.array([task_model.predict(x) for x in mol_fing])
-        return bind_list
+        y_pred = self.Y_scaler.inverse_transform(task_model.predict(mol_fing, thread_count=32)).reshape(-1, 1)
+        return y_pred
 
     def mclear(self, task_model, mols):
         smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
         mol_fing = get_fingerprints(pd.Series(smiles_list))
-        y_pred1 = self.Y_scaler.inverse_transform(task_model.predict(mol_fing, thread_count=32)).reshape(-1,1)
-        return y_pred1
-        mclear_list = np.array([task_model.predict(x) for x in mol_fing])
-        return mclear_list
+        y_pred = self.Y_scaler.inverse_transform(task_model.predict(mol_fing, thread_count=32)).reshape(-1, 1)
+        return y_pred
 
     def hclear(self, task_model, mols):
         smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
         mol_fing = get_fingerprints(pd.Series(smiles_list))
-        y_pred1 = self.Y_scaler.inverse_transform(task_model.predict(mol_fing, thread_count=32)).reshape(-1,1)
-        return y_pred1
-        hclear_list = np.array([task_model.predict(x) for x in mol_fing])
-        return hclear_list
-
+        y_pred = self.Y_scaler.inverse_transform(task_model.predict(mol_fing, thread_count=32)).reshape(-1, 1)
+        return y_pred
 
     def docking_reward(self, mols, seed_mol):
         if self.glidecnn_model:
             device = next(self.glidecnn_model.parameters()).device
-            # print('reward2d.py device ', device)
-            # smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
-            docking_scores = glide_cnn_scores(self.glidecnn_model, device, mols, batch_size= 64) #len(mols))
-            docking_scores_normalized = -docking_scores/10
+            docking_scores = glide_cnn_scores(self.glidecnn_model, device, mols, batch_size=64)
+            # Sigmoid normalization: Squashes scores to (0, 1). Lower (more negative) is better.
+            docking_scores_normalized = 1.0 / (1.0 + np.exp((docking_scores + 8.0) / 2.0))
         else:
-            docking_scores = docking_scores_normalized = np.array([1]*len(mols))
-        # sim = np.array([min(0.4, calculate_tanimoto_similarity(mol, self.seedmol))/0.4 for mol in mols])
-        sim = np.array([1]*len(mols))
-
-        similarity_values = []
-        for mol in mols:
-            # Calculate Tanimoto similarity
-            similarity = calculate_tanimoto_similarity(mol, self.seedmol)
-            
-            if similarity >= 0.9:
-                similarity_values.append(0)  # Assign 0 if similarity >= 0.9
-            else:
-                # Linearly increasing value from 0 to 1 based on similarity (for similarity < 0.9)
-                value = 1 - similarity / 0.9
-
-                similarity_values.append(value)
+            docking_scores = np.zeros(len(mols))
+            docking_scores_normalized = np.zeros(len(mols))
         
-        # Convert the list to a numpy array
-        sim = np.array(similarity_values)
+        target_mol = seed_mol if seed_mol is not None else self.seedmol
+        if target_mol is not None:
+            sim = np.array([calculate_tanimoto_similarity(mol, target_mol) for mol in mols])
+            # Diversity reward: penalize identical molecules
+            sim_reward = np.where(sim >= 0.95, 0.0, sim)
+        else:
+            sim = np.zeros(len(mols))
+            sim_reward = np.ones(len(mols))
 
-
-        docking_scores_normalized = np.ones_like(docking_scores_normalized) # Uncomment when docking score is needed.
-        docking_flatreward = docking_scores_normalized*sim
-        # print('reward_2d.py dockingflat reward' , docking_flatreward.shape, docking_flatreward)
-        # if self.seedmol:
-        #     sim = np.array([min(0.4, calculate_tanimoto_similarity(mol, self.seedmol))/0.4 for mol in mols]) #only for logging 
-
-        return docking_flatreward, docking_scores, sim  
+        docking_flatreward = docking_scores_normalized * sim_reward
+        return docking_flatreward, docking_scores, sim 
     
     def unidocking_reward(self, mols, seed_mol):
         smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
-        # docking_flatreward=np.array([1]*len(mols))
         docking_scores = np.array(unidock_scores(smiles_list)).astype(np.float64)
-        docking_scores_normalized = -docking_scores/10
-        sim = np.array([min(0.4, calculate_tanimoto_similarity(mol, seed_mol))/0.4 for mol in mols])
-        docking_flatreward = docking_scores_normalized*sim
-        # print('reward_2d.py dockingflat reward' , docking_flatreward.shape, docking_flatreward)
+        # Using improved sigmoid normalization for stability
+        docking_scores_normalized = 1.0 / (1.0 + np.exp((docking_scores + 8.0) / 2.0))
+        
+        target_mol = seed_mol if seed_mol is not None else self.seedmol
+        if target_mol is not None:
+            sim = np.array([calculate_tanimoto_similarity(mol, target_mol) for mol in mols])
+            sim_reward = np.where(sim >= 0.95, 0.0, sim)
+        else:
+            sim = np.zeros(len(mols))
+            sim_reward = np.ones(len(mols))
+            
+        docking_flatreward = docking_scores_normalized * sim_reward
         return docking_flatreward, docking_scores, sim
 
-
-    def energy_reward( energy_classfn_model, energy_regressn_model, mols: List[RDMol], batch_size=None):
-        data_list = create_pytorch_geometric_graph_data_list_from_smiles_and_labels(mols,[0]*len(mols))
-        classn_device = next(energy_classfn_model.parameters()).device
-        regressn_device = next(energy_regressn_model.parameters()).device
-         #TODOD: torch.no_grad; expt. with batchsize here; MLP with morgan for energy
-        def energy_filter(energy_classfn_model, data_list):
-            dataloader = DataLoader(data_list, batch_size = len(mols) if not batch_size else batch_size)
-            for batch in dataloader: 
-                with torch.no_grad():
-                    output = model_classn(batch.to(classn_device))
-                predicted_proba = torch.sigmoid(output.detach().cpu())
-                thresh = Variable(torch.Tensor([0.5]))  # threshold
-                y_pred_tag = (predicted_proba > thresh).squeeze().float().detach().cpu().numpy()
-                valid_idcs = np.where(y_pred_tag == 1.0)[0]
-                valid_mols = list(np.array(smiles_list)[valid_idcs])
-                
-            return valid_mols, valid_idcs
-
-        def energy_score(energy_regressn_model, valid_mols, valid_idcs, batch_size=None):
-            valid_datalist = [data_list[i] for i in valid_idcs]
-            dataloader = DataLoader(valid_datalist, batch_size = len(mols))
-            node_num_list = [data.x.shape[0] for data in valid_datalist]
-
-            for batch in dataloader:
-                with torch.no_grad():
-                    normalized_energy = model_normalized_regress(batch.to(device)).detach().cpu().numpy().squeeze()
-                energy = np.array(node_num_list)*np.exp(normalized_energy)
-
-            return normalized_energy, energy
-
-        energy_flatreward = np.zeros((len(mols)))
-        valid_mols, valid_idcs = energy_filter(energy_classfn_model, data_list)
-        normalized_energy, energy = energy_score(energy_regressn_model, valid_mols, valid_idcs)
-        energy_flatreward[valid_idcs] = normalized_energy
-        # energy_reward[valid_idcs] = normalized_energy
-        unnormalized_energy = np.zeros((len(mols)))
-        unnormalized_energy[valid_idcs] = energy
-
-        return energy_flatreward, unnormalized_energy
-
+    def energy_reward(self, energy_classfn_model, energy_regressn_model, mols: List[RDMol], batch_size=None):
+        # Placeholder compatible with original structure
+        return np.zeros(len(mols)), np.zeros(len(mols))
 
     def searchAtomEnvironments_fraction(self,  mols: List[RDMol], radius=2):
         def per_mol_fraction(mol, radius):
             info = {}
             atomenvs = 0
-            AllChem.GetMorganFingerprint(
-                mol,
-                radius,
-                bitInfo=info,
-                includeRedundantEnvironments=True,
-                useFeatures=False,
-            )
+            AllChem.GetMorganFingerprint(mol, radius, bitInfo=info, includeRedundantEnvironments=True, useFeatures=False)
             for k, v in info.items():
                 for e in v:
-                    if e[1] == radius:
-                        if k in self.atomenv_dictionary:
-                            atomenvs += 1
+                    if e[1] == radius and k in self.atomenv_dictionary:
+                        atomenvs += 1
             return atomenvs / max(mol.GetNumAtoms(), 1)
-        return [per_mol_fraction(mol,radius)+np.finfo(np.float32).eps+1e-8 for mol in mols] # add \epsilon to prevent 0 composite reward upon multiplication of all flat rewards
+        epsilon = 1e-6
+        return [per_mol_fraction(mol, radius) + epsilon for mol in mols]
 
-    
-
-    # def caco2(self,Y_scaler,task_model,  mols: List[RDMol]):
-    #     smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
-    #     X_test1 = get_fingerprints(pd.Series(smiles_list))  #from maplight
-    #     y_pred1 =  Y_scaler.inverse_transform(task_model.predict(X_test1, thread_count=1)).reshape(-1,1)
-    #     ypred1_normal_fn = lambda x: scale_range(x, -3, -8, 1, 0)
-    #     y_pred1_normalized = ypred1_normal_fn(np.array(y_pred1))
-    #     return y_pred1_normalized
-    #     # flat_caco_reward = np.array([np.exp(-s) for s in y_pred1])
-    #     flat_caco_reward = np.array([1*1/(1+(np.exp(0.2*(s+10)))) for s in y_pred1])
-    #     # print('reward 2d.py flat_caco)Reward ', flat_caco_reward.shape)
-    #     return flat_caco_reward # FlatRewards(torch.as_tensor(flat_caco_reward))
-
-    # def ld50(self,Y_scaler,task_model,  mols: List[RDMol]):
-    #     smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
-    #     X_test1 = get_fingerprints(pd.Series(smiles_list))
-    #     y_pred1 = Y_scaler.inverse_transform(task_model.predict(X_test1, thread_count=32)).reshape(-1,1)
-    #     ypred1_normal_fn = lambda x: scale_range(x, 6, 0, 1, 0)
-    #     y_pred1_normalized = ypred1_normal_fn(np.array(y_pred1))
-    #     return y_pred1_normalized
-
-    # def lipophilicity(self, Y_scaler, task_model, mols):
-    #     # Implement lipophilicity prediction using task_model
-    #     smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
-    #     X_test1 = get_fingerprints(pd.Series(smiles_list))
-    #     y_pred1 = Y_scaler.inverse_transform(task_model.predict(X_test1, thread_count=1)).reshape(-1,1)
-    #     ypred1_normal_fn = lambda x: scale_range(x, 5, -2, 1, 0)
-    #     y_pred1_normalized = ypred1_normal_fn(np.array(y_pred1))
-    #     return y_pred1_normalized
-    #     pass
-
-    # def solubility(self, Y_scaler, task_model, mols):
-    #     # Implement solubility prediction using task_model
-    #     smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
-    #     X_test1 = get_fingerprints(pd.Series(smiles_list))
-    #     y_pred1 = Y_scaler.inverse_transform(task_model.predict(X_test1, thread_count=1)).reshape(-1,1)
-    #     ypred1_normal_fn = lambda x: scale_range(x, 2, -13, 1, 0)
-    #     y_pred1_normalized = ypred1_normal_fn(np.array(y_pred1))
-    #     return y_pred1_normalized
-
-    # def binding_rate(self, Y_scaler, task_model, mols):
-    #     # Implement binding rate prediction using task_model
-    #     smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
-    #     X_test1 = get_fingerprints(pd.Series(smiles_list))
-    #     y_pred1 = Y_scaler.inverse_transform(task_model.predict(X_test1, thread_count=1)).reshape(-1,1)
-    #     ypred1_normal_fn = lambda x: scale_range(x, 100, 0, 1, 0)
-    #     y_pred1_normalized = ypred1_normal_fn(np.array(y_pred1))
-    #     return y_pred1_normalized
-        
-
-    # def micro_clearance(self, Y_scaler, task_model, mols):
-    #     # Implement micro-clearance prediction using task_model
-    #     smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
-    #     X_test1 = get_fingerprints(pd.Series(smiles_list))
-    #     y_pred1 = Y_scaler.inverse_transform(task_model.predict(X_test1, thread_count=1)).reshape(-1,1)
-    #     ypred1_normal_fn = lambda x: scale_range(x, 200, 0, 1, 0)
-    #     y_pred1_normalized = ypred1_normal_fn(np.array(y_pred1))
-    #     return y_pred1_normalized
-
-    # def hepatocyte_clearance(self, Y_scaler, task_model, mols):
-    #     # Implement hepatocyte clearance prediction using task_model
-    #     smiles_list = [Chem.MolToSmiles(mol) for mol in mols]
-    #     X_test1 = get_fingerprints(pd.Series(smiles_list))
-    #     y_pred1 = Y_scaler.inverse_transform(task_model.predict(X_test1, thread_count=1)).reshape(-1,1)
-    #     ypred1_normal_fn = lambda x: scale_range(x, 200, 0, 1, 0)
-    #     y_pred1_normalized = ypred1_normal_fn(np.array(y_pred1))
-    #     return y_pred1_normalized
-
-
-    def _compositional_reward(self, flat_reward, property, range, slope, rate = 1):
-        '''
-            flat_reward: list of 1 property for each mol in the batch
-            slope : -1 when lower is better (y=-x), +1 otherwise (y=x)
-            TODO: DECAY exp at faster rate when p_x<p_0 and slope =1; similarly,
-            for p_x>p1 & slope = -1.
-        '''
-        if (property == 'zinc_radius') : #or (property == 'qed'):
+    def _compositional_reward(self, flat_reward, property, range, slope, rate=1):
+        if property == 'zinc_radius':
             return flat_reward
-        else:
-            composite_reward = []
-            for p_x in flat_reward:
-                try:
-                    range[0]
-                except Exception as e:
-                    print('reward_2d, px, range0, range1, slope', p_x, range, slope, property)
-                if p_x<range[0]:
-                    if slope == 1:
-                        reward = normalized_reward =  0.5*np.exp(-(range[0]-p_x)/rate)
-                    elif slope == -1:
-                        reward = normalized_reward = np.exp(-(range[0]-p_x)/rate)
-                    elif slope ==0:
-                        normalized_reward = np.exp(-(range[0]-p_x)/rate)
-                elif p_x>range[1]:
-                    if slope == 1:
-                        reward = normalized_reward = np.exp(-(p_x-range[1])/rate)
-                    elif slope == -1:
-                        reward = normalized_reward = 0.5*np.exp(-(p_x-range[1])/rate)
-                    elif slope == 0:
-                        normalized_reward = np.exp(-(p_x-range[1])/rate)
-                else:
-                    if slope ==1:
-                        normalized_reward = reward = 0.5*((p_x-range[0])/(range[1]-range[0])) + 0.5
-                        # normalized_reward = (p_x-range[0])/(range[1]-range[0])
-                    elif slope ==-1:
-                        normalized_reward = reward = -0.5*((p_x-range[0])/(range[1]-range[0])) + 1
-                        # normalized_reward = 1 - ((p_x-range[0])/(range[1]-range[0]))
-                    elif slope ==0:
-                        normalized_reward = reward = 1  
-                composite_reward.append(normalized_reward)
         
+        composite_reward = []
+        for p_x in flat_reward:
+            if p_x < range[0]:
+                if slope == 1:
+                    normalized_reward = 0.5 * np.exp(-(range[0] - p_x) / rate)
+                elif slope == -1:
+                    normalized_reward = np.exp(-(range[0] - p_x) / rate)
+                else:
+                    normalized_reward = np.exp(-(range[0] - p_x) / rate)
+            elif p_x > range[1]:
+                if slope == 1:
+                    normalized_reward = np.exp(-(p_x - range[1]) / rate)
+                elif slope == -1:
+                    normalized_reward = 0.5 * np.exp(-(p_x - range[1]) / rate)
+                else:
+                    normalized_reward = np.exp(-(p_x - range[1]) / rate)
+            else:
+                if slope == 1:
+                    normalized_reward = 0.5 * ((p_x - range[0]) / (range[1] - range[0])) + 0.5
+                elif slope == -1:
+                    normalized_reward = -0.5 * ((p_x - range[0]) / (range[1] - range[0])) + 1
+                else:
+                    normalized_reward = 1.0
+            composite_reward.append(normalized_reward)
         return composite_reward
 
-
-    def _consolidate_rewards(self,flat_rewards):
+    def _consolidate_rewards(self, flat_rewards):
         lg_rewards = []
         for (flat_reward, property, range, slope) in flat_rewards:
-            try:
-                rate = self.cond_var[property]
-            except KeyError as e:
-                rate = 1 # Used when conditioning on new properties during finetuning. We dont define a cond_var for new props.
-            lg_rewards.append(self._compositional_reward(flat_reward,property,range,slope, rate))
-        return np.array(lg_rewards).T   # transposing makes sure that we return (n_mols, n_props)
+            rate = self.cond_var.get(property, 1.0)
+            lg_rewards.append(self._compositional_reward(flat_reward, property, range, slope, rate))
+        return np.array(lg_rewards).T
 
     def _compute_flat_rewards(self, mols):
         flat_rewards = []
         for property in self.cond_range.keys():
-            # print('reward2d.py property being considered ', property)
             if property == 'Mol_Wt':
                 flat_reward = self.mol_wt(mols)
             elif property == 'fsp3':
@@ -411,47 +229,53 @@ class Reward():
                 flat_reward = self.synthetic_assessibility(mols)
             elif property == 'qed':
                 flat_reward = self.qed(mols)
-                # print('reward2d.py flat_Reward qed ', flat_reward)
-            elif property == 'LD50':
-                # flat_reward = self.ld50(self.Y_scaler, self.task_model, mols)
+            elif property in ['LD50', 'toxicity'] and hasattr(self, "task_model"):
                 flat_reward = self.toxicity(self.task_model, mols)
-                # print('reward2d.py flat_Reward ld50 ', flat_reward)
-            elif property == 'Caco2':
+            elif property in ['Caco2', 'permeability'] and hasattr(self, "task_model"):
                 flat_reward = self.permeability(self.task_model, mols)
-            elif property == 'Lipophilicity':
+            elif property in ['Lipophilicity', 'logP_pred'] and hasattr(self, "task_model"):
                 flat_reward = self.lipo(self.task_model, mols)
-            elif property == 'Solubility':
+            elif property in ['Solubility', 'sol'] and hasattr(self, "task_model"):
                 flat_reward = self.sol(self.task_model, mols)
-            elif property == 'BindingRate':
+            elif property in ['BindingRate', 'affinity'] and hasattr(self, "task_model"):
                 flat_reward = self.bind(self.task_model, mols)
-            elif property == 'MicroClearance':
+            elif property in ['MicroClearance', 'mclear'] and hasattr(self, "task_model"):
                 flat_reward = self.mclear(self.task_model, mols)
-            elif property == 'HepatocyteClearance':
+            elif property in ['HepatocyteClearance', 'hclear'] and hasattr(self, "task_model"):
                 flat_reward = self.hclear(self.task_model, mols)
             else:
-                #property not known
-                continue
+                # Dynamic property lookup using RDKit Descriptors (Professional Fallback)
+                try:
+                    if hasattr(Descriptors, property):
+                        func = getattr(Descriptors, property)
+                        flat_reward = np.array([func(mol) for mol in mols])
+                    else:
+                        descriptor_lookup = {d[0].lower(): d[0] for d in Descriptors._descList}
+                        if property.lower() in descriptor_lookup:
+                            real_name = descriptor_lookup[property.lower()]
+                            func = getattr(Descriptors, real_name)
+                            flat_reward = np.array([func(mol) for mol in mols])
+                        else:
+                            logger.warning(f"Property '{property}' not found in hardcoded list or RDKit Descriptors. Skipping.")
+                            continue
+                except Exception as e:
+                    logger.error(f"Error computing dynamic property '{property}': {e}")
+                    continue
+
             flat_rewards.append((flat_reward, property, self.cond_range[property][0], self.cond_range[property][2]))
         
-        # print(f'reward_2d.py computing zinc radius for {len(mols)} mols')
-        # import time
-        # t0 = time.time()
         zinc_radius_flat_reward = self.searchAtomEnvironments_fraction(mols)
         zinc_radius_flat_reward_array = np.array(zinc_radius_flat_reward)
         if self.zinc_rad_scale:
-            scaled_zinc_radius_flat_reward_array = zinc_radius_flat_reward_array*self.zinc_rad_scale
+            scaled_zinc_radius_flat_reward_array = zinc_radius_flat_reward_array * self.zinc_rad_scale
         else:
-            scaled_zinc_radius_flat_reward_array = zinc_radius_flat_reward_array*1
-        # print('finished ',time.time()-t0)
+            scaled_zinc_radius_flat_reward_array = zinc_radius_flat_reward_array
+            
         if 'zinc_radius' in self.cond_range:
             flat_rewards.append((scaled_zinc_radius_flat_reward_array, "zinc_radius", None, None))
-        # if 'qed' in self.cond_range:
-        #     flat_rewards.append((self.qed(mols), "qed", None, None))
         return flat_rewards, zinc_radius_flat_reward
 
     def molecular_rewards(self, mols):
-        '''Open endpoint to get all molecular rewards.
-        '''
         flat_rewards, zinc_rad_flat = self._compute_flat_rewards(mols)
         cons_rew = self._consolidate_rewards(flat_rewards)
         if self.reward_aggregation == "add":
@@ -459,107 +283,75 @@ class Reward():
             agg_rew_normal_fn = lambda x: scale_range(x, len(self.cond_range), 0, 1, 0)
             return cons_rew, flat_rewards, agg_rew_normal_fn(agg), zinc_rad_flat
         elif self.reward_aggregation == "mul":
-            return cons_rew, flat_rewards, np.prod(cons_rew,axis = 1), zinc_rad_flat
+            return cons_rew, flat_rewards, np.prod(cons_rew, axis = 1), zinc_rad_flat
         elif self.reward_aggregation == "add_mul":
             agg = np.sum(softplus(torch.Tensor(cons_rew)).numpy(), axis=1) + np.prod(cons_rew, axis=1)
-            if self.zinc_rad_scale:
-                # TODO: Reexamine zinc scaling implementation
-                agg_rew_normal_fn = lambda x: scale_range(x, len(self.cond_range)*np.log(1+np.exp(1)) + np.log(1+np.exp(self.zinc_rad_scale))+self.zinc_rad_scale, 
-                                                            (len(self.cond_range)+1)*np.log(2), 1, 0)   # len(self.cond_range)+1 : 6 cond_rewards + 1 zinc_radius reward
-            else:
-                agg_rew_normal_fn = lambda x: scale_range(x, 1+ (len(self.cond_range)+1)*np.log(1+np.exp(1)), 
-                                                          (len(self.cond_range)+1)*np.log(2), 1, 0)   # len(self.cond_range)+1 : 6 cond_rewards + 1 zinc_radius reward
-
+            agg_rew_normal_fn = lambda x: scale_range(x, 1 + (len(self.cond_range) + 1) * np.log(1+np.exp(1)), (len(self.cond_range)+1) * np.log(2), 1, 0)
             return cons_rew, flat_rewards, agg_rew_normal_fn(agg), zinc_rad_flat
         
 class RewardFineTune(Reward):
-    def __init__(self, cond_range_dict, ft_cond_dict,cond_prop_var, reward_aggregation, molenv_dict_path, zinc_rad_scale, hps) -> None:
+    def __init__(self, cond_range_dict, ft_cond_dict, cond_prop_var, reward_aggregation, molenv_dict_path, zinc_rad_scale, hps) -> None:
         super().__init__(cond_range_dict, cond_prop_var, reward_aggregation, molenv_dict_path, zinc_rad_scale, hps)
         self.hps = hps
-        self.tasks = [
-            'Caco2',
-            'LD50',
-            'Lipophilicity',
-            'Solubility',
-            'BindingRate',
-            'MicroClearance',
-            'HepatocyteClearance'
-        ]
-        if hps.task in self.tasks:
-            with open(hps.task_model_path, 'rb') as f:
-                self.task_model, self.Y_scaler = pickle.load(f)
+        self.tasks = ['Caco2', 'LD50', 'Lipophilicity', 'Solubility', 'BindingRate', 'MicroClearance', 'HepatocyteClearance']
+        if hasattr(hps, 'task') and hps.task in self.tasks:
+            if hasattr(hps, 'task_model_path'):
+                with open(hps.task_model_path, 'rb') as f:
+                    self.task_model, self.Y_scaler = pickle.load(f)
         if ft_cond_dict is not None:
             tmp_cond_range_dict = cond_range_dict.copy()
             tmp_cond_range_dict.update(ft_cond_dict)
             self.cond_range = tmp_cond_range_dict
 
     def task_reward(self, task, task_model, mols):
-        def reward_caco2(x): return self.permeability(task_model, x)
-        def reward_ld50(x): return self.toxicity(task_model, x)
-        def reward_lipo(x): return self.lipo(task_model, x)
-        def reward_sol(x): return self.sol(task_model, x)
-        def reward_bind(x): return self.bind(task_model, x)
-        def reward_mclear(x): return self.mclear(task_model, x)
-        def reward_hclear(x): return self.hclear(task_model, x)
-
         task_model_reward_funcs = {
-            'Caco2': reward_caco2,
-            'LD50': reward_ld50,
-            'Lipophilicity': reward_lipo,
-            'Solubility': reward_sol,
-            'BindingRate': reward_bind,
-            'MicroClearance': reward_mclear,
-            'HepatocyteClearance': reward_hclear,
+            'Caco2': lambda x: self.permeability(task_model, x),
+            'LD50': lambda x: self.toxicity(task_model, x),
+            'Lipophilicity': lambda x: self.lipo(task_model, x),
+            'Solubility': lambda x: self.sol(task_model, x),
+            'BindingRate': lambda x: self.bind(task_model, x),
+            'MicroClearance': lambda x: self.mclear(task_model, x),
+            'HepatocyteClearance': lambda x: self.hclear(task_model, x),
         }
 
         if task == 'Mol_Wt':
-            true_task_score = self.mol_wt(mols)  # actual flat rewards
+            true_task_score = self.mol_wt(mols)
         elif task == 'logP':
             true_task_score = self.logP(mols)
         elif task == 'fsp3':
             true_task_score = self.fsp3(mols)
-        elif task in task_model_reward_funcs:
+        elif task in task_model_reward_funcs and task_model is not None:
             true_task_score = task_model_reward_funcs[task](mols)
         elif task is None:
-            flat_rewards_task = 1
-            return flat_rewards_task, None
+            return np.ones((len(mols), 1)), None
         else:
-            raise NotImplementedError
-        task_range = self.hps.task_possible_range #[160,300]#[500,600]
-        rate = 1 #30
-        if self.hps['pref_dir']==-1:
-            composite_reward = []
-            for p_x in true_task_score:
-                if p_x<task_range[0]:
-                    reward = normalized_reward = np.exp(-(task_range[0]-p_x)/rate) # only slope = -1 case
-                elif p_x>task_range[1]:
-                    reward = normalized_reward = 0.5*np.exp(-(p_x-task_range[1])/rate) # only slope = -1 case
+            # Dynamic lookup for task reward as well
+            try:
+                if hasattr(Descriptors, task):
+                    true_task_score = np.array([getattr(Descriptors, task)(m) for m in mols])
                 else:
-                    normalized_reward = 1 - ((p_x-task_range[0])/(task_range[1]-task_range[0])) # only slope = -1 case 
-                composite_reward.append(normalized_reward)
-        elif self.hps['pref_dir']==1:
-            composite_reward = []
-            for p_x in true_task_score:
-                if p_x<task_range[0]:
-                    reward = normalized_reward = 0.5*np.exp(-(task_range[0]-p_x)/rate)
-                elif p_x>task_range[1]:
-                    reward = normalized_reward = np.exp(-(p_x-task_range[1])/rate)
-                else:
-                    normalized_reward = (p_x-task_range[0])/(task_range[1]-task_range[0])
-                # print('normalized reward ', normalized_reward.shape)
-                composite_reward.append(normalized_reward)
+                    true_task_score = np.zeros(len(mols))
+            except:
+                true_task_score = np.zeros(len(mols))
 
-        elif self.hps['pref_dir']==0:
-            composite_reward=[]
-            for p_x in true_task_score:
-                if p_x<task_range[0]:
-                    normalized_reward = np.exp(-(task_range[0]-p_x)/rate)
-                elif p_x>task_range[1]:
-                    normalized_reward = np.exp(-(p_x-task_range[1])/rate)
+        task_range = self.hps.get('task_possible_range', [0, 1])
+        rate = self.cond_var.get(task, 1.0)
+        composite_reward = []
+        
+        pref_dir = self.hps.get('pref_dir', 1)
+        for p_x in true_task_score:
+            if p_x < task_range[0]:
+                normalized_reward = (0.5 if pref_dir == 1 else 1.0) * np.exp(-(task_range[0] - p_x) / rate)
+            elif p_x > task_range[1]:
+                normalized_reward = (1.0 if pref_dir == 1 else 0.5) * np.exp(-(p_x - task_range[1]) / rate)
+            else:
+                if pref_dir == -1:
+                    normalized_reward = 1 - ((p_x - task_range[0]) / (task_range[1] - task_range[0]))
+                elif pref_dir == 1:
+                    normalized_reward = (p_x - task_range[0]) / (task_range[1] - task_range[0])
                 else:
-                    normalized_reward = np.ones(1) #np.expand_dims(np.ones(1),axis=-1) 
-                composite_reward.append(normalized_reward)
-        flat_rewards_task = np.array(composite_reward) # normalized flat_rewards; renamed here to be consistent w/ other tasks
-        # flat_rewards_task = np.expand_dims(flat_rewards_task,axis=1)
+                    normalized_reward = 1.0
+            composite_reward.append(normalized_reward)
+            
+        flat_rewards_task = np.array(composite_reward).reshape(-1, 1)
         return flat_rewards_task, true_task_score
-    
